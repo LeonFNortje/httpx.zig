@@ -54,6 +54,11 @@ pub const TlsConfig = struct {
     max_version: TlsVersion = .tls_1_3,
     verify_mode: VerifyMode = .peer,
     verify_hostname: bool = true,
+    /// Whether a peer that closes the transport without sending a TLS
+    /// close_notify alert is treated as a clean EOF (true) or surfaced as a
+    /// truncation error (false). Defaults to true to preserve the historical
+    /// behavior of this wrapper.
+    allow_truncation_attacks: bool = true,
     ca_file: ?[]const u8 = null,
     ca_path: ?[]const u8 = null,
     cert_file: ?[]const u8 = null,
@@ -218,7 +223,7 @@ pub const TlsSession = struct {
             else
                 .{ .no_verification = {} },
             .ssl_key_log = null,
-            .allow_truncation_attacks = true,
+            .allow_truncation_attacks = self.config.allow_truncation_attacks,
             .write_buffer = self.tls_write_buf.?,
             .read_buffer = self.tls_read_buf.?,
             .entropy = &entropy,
