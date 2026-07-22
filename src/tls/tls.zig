@@ -1,21 +1,27 @@
 //! TLS/SSL Support for httpx.zig
 //!
 //! Provides TLS configuration and a session wrapper for HTTPS connections.
-//! This module uses Zig's standard library TLS client (`std.crypto.tls.Client`).
+//!
+//! ## Backend
+//!
+//! This wrapper is backed by the vendored `ianic/tls.zig` library (see
+//! `src/tls/tlszig/VENDOR.md`), consumed as the `tls` module. Unlike
+//! `std.crypto.tls.Client`, tls.zig advertises ALPN protocols in the ClientHello
+//! and exposes the negotiated protocol after the handshake. That negotiated value
+//! is stored in `TlsSession.negotiated_protocol`, which the HTTP client reads to
+//! route between the HTTP/2 and HTTP/1.1 code paths over the same TLS session.
 //!
 //! ## Notes
 //!
-//! - This is a thin wrapper around the stdlib TLS implementation.
-//! - ALPN negotiation is not currently surfaced by `std.crypto.tls.Client` in a
-//!   way this library uses for strict HTTP/2 protocol selection.
-//! - The higher-level HTTP client supports HTTP/1.1 and an HTTP/2 runtime path
-//!   over TLS, but strict ALPN-dependent server negotiation is not yet exposed.
+//! - `handshake()` advertises `config.alpn_protocols` and records the negotiated
+//!   protocol (or leaves it null when the server does not select one).
 //! - The high-level HTTP/3 runtime path uses UDP + QUIC framing primitives and
 //!   does not go through this TLS wrapper.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const builtin = @import("builtin");
+const tlsz = @import("tls");
 const Socket = @import("../net/socket.zig").Socket;
 const SocketIoReader = @import("../net/socket.zig").SocketIoReader;
 const SocketIoWriter = @import("../net/socket.zig").SocketIoWriter;
@@ -63,7 +69,11 @@ pub const TlsConfig = struct {
     ca_path: ?[]const u8 = null,
     cert_file: ?[]const u8 = null,
     key_file: ?[]const u8 = null,
-    // Reserved for future protocol negotiation plumbing.
+    /// ALPN protocols advertised in the ClientHello. The server selects one; the
+    /// choice is surfaced via `TlsSession.negotiated_protocol`. Defaults to
+    /// HTTP/1.1-only so callers that do not opt into HTTP/2 keep the previous
+    /// behavior. The HTTP client sets `{"h2","http/1.1"}` for request paths that
+    /// can use HTTP/2.
     alpn_protocols: []const []const u8 = &.{"http/1.1"},
     cipher_suites: ?[]const u8 = null,
     server_name: ?[]const u8 = null,
@@ -106,6 +116,11 @@ pub const TlsConfig = struct {
 };
 
 /// TLS session state.
+///
+/// Heap-pinning invariant: after `handshake()`, the tls.zig `Connection` holds
+/// pointers into this struct's socket reader/writer, and the cached
+/// `Reader`/`Writer` hold a pointer back into `conn`. Do not move a `TlsSession`
+/// (or copy it by value) after the handshake — keep it pinned for its lifetime.
 pub const TlsSession = struct {
     allocator: Allocator,
     config: TlsConfig,
@@ -114,16 +129,21 @@ pub const TlsSession = struct {
     connected: bool = false,
     socket: ?*Socket = null,
 
+    // Socket-side (ciphertext) buffers and the Io reader/writer over the socket.
     net_read_buf: ?[]u8 = null,
     net_write_buf: ?[]u8 = null,
-    tls_read_buf: ?[]u8 = null,
-    tls_write_buf: ?[]u8 = null,
     net_in: ?SocketIoReader = null,
     net_out: ?SocketIoWriter = null,
 
+    // Application-side (cleartext) buffers backing the Io.Reader/Io.Writer that
+    // the HTTP/1.1 path reads and writes through.
+    app_read_buf: ?[]u8 = null,
+    app_write_buf: ?[]u8 = null,
+
     ca_bundle: ?std.crypto.Certificate.Bundle = null,
-    ca_bundle_lock: std.Io.RwLock = .init,
-    client: ?std.crypto.tls.Client = null,
+    conn: ?tlsz.Connection = null,
+    tls_reader: ?tlsz.Connection.Reader = null,
+    tls_writer: ?tlsz.Connection.Writer = null,
 
     const Self = @This();
 
@@ -137,9 +157,9 @@ pub const TlsSession = struct {
 
     /// Releases session resources.
     pub fn deinit(self: *Self) void {
-        if (self.client != null) {
-            self.client = null;
-        }
+        self.conn = null;
+        self.tls_reader = null;
+        self.tls_writer = null;
 
         if (self.ca_bundle) |*bundle| {
             bundle.deinit(self.allocator);
@@ -148,13 +168,13 @@ pub const TlsSession = struct {
 
         if (self.net_read_buf) |buf| self.allocator.free(buf);
         if (self.net_write_buf) |buf| self.allocator.free(buf);
-        if (self.tls_read_buf) |buf| self.allocator.free(buf);
-        if (self.tls_write_buf) |buf| self.allocator.free(buf);
+        if (self.app_read_buf) |buf| self.allocator.free(buf);
+        if (self.app_write_buf) |buf| self.allocator.free(buf);
 
         self.net_read_buf = null;
         self.net_write_buf = null;
-        self.tls_read_buf = null;
-        self.tls_write_buf = null;
+        self.app_read_buf = null;
+        self.app_write_buf = null;
         self.net_in = null;
         self.net_out = null;
     }
@@ -166,32 +186,31 @@ pub const TlsSession = struct {
 
     /// Performs the TLS handshake.
     ///
-    /// When `config.alpn_protocols` contains entries they are advertised in
-    /// the ClientHello.  After a successful handshake the negotiated protocol
-    /// (if any) is stored in `self.negotiated_protocol`.
+    /// The protocols in `config.alpn_protocols` are advertised in the ClientHello.
+    /// After a successful handshake the negotiated protocol (if any) is stored in
+    /// `self.negotiated_protocol` for the HTTP client to route on.
     pub fn handshake(self: *Self, hostname: []const u8) !void {
-        const tls = std.crypto.tls;
         const sock = self.socket orelse return error.MissingTransport;
-        const min_tls_buf = tls.Client.min_buffer_len;
-        const net_buf_len: usize = @max(16 * 1024, min_tls_buf);
 
-        // Allocate buffers once per session.
-        if (self.net_read_buf == null) self.net_read_buf = try self.allocator.alloc(u8, net_buf_len);
-        if (self.net_write_buf == null) self.net_write_buf = try self.allocator.alloc(u8, net_buf_len);
+        // Socket-side buffers. tls.zig needs the input reader buffer to hold a
+        // full TLS record (input_buffer_len) and the output writer buffer to hold
+        // a ClientHello / one encrypted record (output_buffer_len).
+        const net_in_len: usize = @max(16 * 1024, tlsz.input_buffer_len);
+        const net_out_len: usize = @max(16 * 1024, tlsz.output_buffer_len);
+        if (self.net_read_buf == null) self.net_read_buf = try self.allocator.alloc(u8, net_in_len);
+        if (self.net_write_buf == null) self.net_write_buf = try self.allocator.alloc(u8, net_out_len);
 
-        if (self.tls_read_buf == null) self.tls_read_buf = try self.allocator.alloc(u8, min_tls_buf);
-        if (self.tls_write_buf == null) self.tls_write_buf = try self.allocator.alloc(u8, min_tls_buf);
+        // Cleartext buffers for the HTTP/1.1 Io.Reader/Io.Writer.
+        if (self.app_read_buf == null) self.app_read_buf = try self.allocator.alloc(u8, 16 * 1024);
+        if (self.app_write_buf == null) self.app_write_buf = try self.allocator.alloc(u8, 16 * 1024);
 
-        const net_in = SocketIoReader.init(sock, self.net_read_buf.?);
-        const net_out = SocketIoWriter.init(sock, self.net_write_buf.?);
-        self.net_in = net_in;
-        self.net_out = net_out;
+        self.net_in = SocketIoReader.init(sock, self.net_read_buf.?);
+        self.net_out = SocketIoWriter.init(sock, self.net_write_buf.?);
         const io = defaultIo();
 
         const verify = self.config.verify_mode != .none;
-        const verify_host = verify and self.config.verify_hostname;
 
-        // System CA bundle (cross-platform); optional if verification is disabled.
+        // System CA bundle (cross-platform); only needed when verifying.
         if (verify) {
             var bundle: std.crypto.Certificate.Bundle = .empty;
             errdefer bundle.deinit(self.allocator);
@@ -200,80 +219,60 @@ pub const TlsSession = struct {
         }
 
         const sni_host = self.config.server_name orelse hostname;
-        var entropy: [tls.Client.Options.entropy_len]u8 = undefined;
-        io.random(&entropy);
-        const ca_bundle_ptr: ?*std.crypto.Certificate.Bundle = if (self.ca_bundle) |*b| b else null;
+        var rng_impl: std.Random.IoSource = .{ .io = io };
 
-        // ALPN: advertise the protocols the caller requested so the server
-        // can select one.  The stdlib Client does not yet accept an ALPN
-        // option in `Options`, so we pass the protocols through when
-        // support lands; for now this is stored for future wiring.
-        const alpn = self.config.alpn_protocols;
-        _ = alpn;
-
-        const client = try tls.Client.init(&self.net_in.?.reader, &self.net_out.?.writer, .{
-            .host = if (verify_host) .{ .explicit = sni_host } else .{ .no_verification = {} },
-            .ca = if (verify)
-                .{ .bundle = .{
-                    .gpa = self.allocator,
-                    .io = io,
-                    .lock = &self.ca_bundle_lock,
-                    .bundle = ca_bundle_ptr.?,
-                } }
-            else
-                .{ .no_verification = {} },
-            .ssl_key_log = null,
-            .allow_truncation_attacks = self.config.allow_truncation_attacks,
-            .write_buffer = self.tls_write_buf.?,
-            .read_buffer = self.tls_read_buf.?,
-            .entropy = &entropy,
-            .realtime_now = std.Io.Timestamp.now(io, .real),
-            .alert = null,
+        const conn = try tlsz.client(&self.net_in.?.reader, &self.net_out.?.writer, .{
+            .host = sni_host,
+            .root_ca = self.ca_bundle orelse .empty,
+            // tls.zig couples chain and hostname verification under one flag.
+            .insecure_skip_verify = !verify,
+            .alpn_protocols = self.config.alpn_protocols,
+            .now = std.Io.Timestamp.now(io, .real),
+            .rng = rng_impl.interface(),
         });
 
-        self.client = client;
+        self.conn = conn;
         self.connected = true;
 
-        // Read back the negotiated ALPN protocol from the TLS client.
-        // The stdlib Client does not yet surface the ALPN result; once
-        // it does, read the negotiated protocol string here and store
-        // it.  For now we leave it null and let the caller treat null
-        // as "unknown / HTTP/1.1".
-        self.negotiated_protocol = null;
+        // Pin the cleartext Reader/Writer over the stored Connection so the
+        // HTTP/1.1 path has stable Io interfaces for its lifetime.
+        self.tls_reader = self.conn.?.reader(self.app_read_buf.?);
+        self.tls_writer = self.conn.?.writer(self.app_write_buf.?);
+
+        // Surface the negotiated ALPN protocol so the HTTP client routes
+        // HTTP/2 vs HTTP/1.1. Null means the server selected nothing → HTTP/1.1.
+        self.negotiated_protocol = self.conn.?.alpn_protocol;
     }
 
     /// Reads decrypted data from the session.
     pub fn read(self: *Self, buffer: []u8) !usize {
-        const c = if (self.client) |*c| c else return error.NotConnected;
-        return c.reader.readSliceShort(buffer);
+        const c = if (self.conn) |*c| c else return error.NotConnected;
+        return c.read(buffer);
     }
 
-    /// Writes data to be encrypted and sent.
+    /// Writes data to be encrypted and sent. Returns the number of bytes accepted.
     pub fn write(self: *Self, data: []const u8) !usize {
-        const c = if (self.client) |*c| c else return error.NotConnected;
-        try c.writer.writeAll(data);
-        return data.len;
+        const c = if (self.conn) |*c| c else return error.NotConnected;
+        return c.write(data);
     }
 
-    /// Flushes any buffered encrypted data to the underlying transport.
+    /// Flushes any buffered cleartext through the TLS layer to the socket.
     pub fn flush(self: *Self) !void {
-        const c = if (self.client) |*c| c else return error.NotConnected;
-        try c.writer.flush();
-        if (self.net_out) |*out| {
-            try out.writer.flush();
-        }
+        if (self.conn == null) return error.NotConnected;
+        if (self.tls_writer) |*w| try w.interface.flush();
+        if (self.net_out) |*out| try out.writer.flush();
     }
 
     /// Returns an I/O reader for decrypted TLS payload.
     pub fn getReader(self: *Self) !*std.Io.Reader {
-        const c = if (self.client) |*c| c else return error.NotConnected;
-        return &c.reader;
+        if (self.tls_reader == null) return error.NotConnected;
+        return &self.tls_reader.?.interface;
     }
 
     /// Returns an I/O writer for TLS-encrypted payload.
     pub fn getWriter(self: *Self) !*std.Io.Writer {
-        const c = if (self.client) |*c| c else return error.NotConnected;
-        return &c.writer;
+        if (self.tls_writer == null) return error.NotConnected;
+        return &self.tls_writer.?.interface;
     }
 
     /// Returns the negotiated ALPN protocol.
@@ -297,7 +296,9 @@ pub const TlsSession = struct {
     /// Closes the TLS session.
     pub fn close(self: *Self) void {
         self.connected = false;
-        self.client = null;
+        self.conn = null;
+        self.tls_reader = null;
+        self.tls_writer = null;
     }
 };
 

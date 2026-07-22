@@ -17,13 +17,23 @@ pub fn build(b: *std.Build) void {
 
     const optimize = b.standardOptimizeOption(.{});
 
+    // Vendored ianic/tls.zig, consumed as a local module (see src/tls/tlszig/VENDOR.md). It
+    // supplies the ALPN advertisement + negotiated-protocol exposure that std.crypto.tls.Client
+    // lacks, which is exactly what gates HTTP/2 selection in the client. Every module that roots
+    // src/httpx.zig pulls in src/tls/tls.zig, so each such module needs this import.
+    const tls_module = b.createModule(.{
+        .root_source_file = b.path("src/tls/tlszig/root.zig"),
+    });
+
     const httpx_module = b.createModule(.{
         .root_source_file = b.path("src/httpx.zig"),
     });
+    httpx_module.addImport("tls", tls_module);
 
-    _ = b.addModule("httpx", .{
+    const httpx_pub_module = b.addModule("httpx", .{
         .root_source_file = b.path("src/httpx.zig"),
     });
+    httpx_pub_module.addImport("tls", tls_module);
 
     const examples = [_]struct { name: []const u8, path: []const u8, skip_run_all: bool = false }{
         .{ .name = "simple_get", .path = "examples/simple_get.zig" },
@@ -127,6 +137,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    tests.root_module.addImport("tls", tls_module);
     linkPlatformLibs(tests, target);
 
     const run_tests = b.addRunArtifact(tests);
@@ -183,6 +194,7 @@ pub fn build(b: *std.Build) void {
                 .optimize = optimize,
             }),
         });
+        lib_cross.root_module.addImport("tls", tls_module);
         linkPlatformLibs(lib_cross, target_cross);
 
         // Just build the artifact to verify it compiles
@@ -198,6 +210,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    lib.root_module.addImport("tls", tls_module);
     linkPlatformLibs(lib, target);
 
     b.installArtifact(lib);

@@ -1500,6 +1500,9 @@ pub const Client = struct {
                         if ((frame.header.flags & 0x01) != 0) {
                             got_end_stream = true;
                             request_stream.receiveEndStream();
+                            // END_STREAM on the response HEADERS closes the stream (no body,
+                            // no trailers): the response is complete, stop reading.
+                            response_done = true;
                         }
                     } else {
                         pending_headers_flags = frame.header.flags;
@@ -1553,6 +1556,9 @@ pub const Client = struct {
                             if ((pending_headers_flags & 0x01) != 0) {
                                 got_end_stream = true;
                                 request_stream.receiveEndStream();
+                                // END_STREAM on the (continuation-completed) response HEADERS
+                                // closes the stream: the response is complete, stop reading.
+                                response_done = true;
                             }
                         }
                     }
@@ -1585,6 +1591,9 @@ pub const Client = struct {
                     if ((frame.header.flags & 0x01) != 0) {
                         got_end_stream = true;
                         request_stream.receiveEndStream();
+                        // END_STREAM on the final DATA frame closes the stream: the body is
+                        // complete and no trailers can follow, so stop reading.
+                        response_done = true;
                     }
                 },
             }
