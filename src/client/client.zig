@@ -1334,25 +1334,38 @@ pub const Client = struct {
         try transport.writeAll(headers_frames);
 
         var peer_max_frame_size: u32 = local_settings.max_frame_size;
+        var peer_settings = http.Http2Connection.Http2ConnectionSettings{};
+
+        // Response frames the peer sent while we were still uploading (a legal early response); replayed to the response loop below,
+        // in order, before any further socket read. Payloads owned; the deinit frees only the not-yet-consumed tail (consumed ones
+        // are freed by the response loop's per-iteration defer).
+        var pending_frames = std.ArrayList(BufferedFrame).empty;
+        var pending_index: usize = 0;
+        defer {
+            for (pending_frames.items[pending_index..]) |pf| self.allocator.free(pf.payload);
+            pending_frames.deinit(self.allocator);
+        }
+
+        var pump_frames: usize = 0;
 
         if (has_body) {
             const body = req.body.?;
             var offset: usize = 0;
             while (offset < body.len) {
-                if (request_stream.send_window <= 0 or stream_manager.connection_send_window <= 0) {
-                    return error.FlowControlError;
+                // Correct HTTP/2 flow control: instead of erroring the instant a window hits zero, wait and process the peer's
+                // SETTINGS/WINDOW_UPDATE frames until it grants window. Lets request bodies exceed the initial 65535-byte window
+                // (e.g. a chat-completion prompt with many tool schemas). Bounded so a peer that never grants window (or floods
+                // frames) cannot spin forever — mirrors the response loop's >10_000 guard.
+                while (request_stream.send_window <= 0 or stream_manager.connection_send_window <= 0) {
+                    pump_frames += 1;
+                    if (pump_frames > 10_000) return error.ProtocolError;
+                    try self.pumpUntilSendWindow(transport, &stream_manager, request_stream, &peer_settings, &peer_max_frame_size, &pending_frames);
                 }
                 const max_chunk = @min(@as(usize, @intCast(request_stream.send_window)), @as(usize, @intCast(stream_manager.connection_send_window)));
                 const chunk_len = @min(body.len - offset, max_chunk, @as(usize, @intCast(peer_max_frame_size)));
                 const is_last = offset + chunk_len == body.len;
                 const chunk_flags: u8 = if (is_last) 0x01 else 0;
-                try writeHttp2Frame(
-                    transport,
-                    .data,
-                    chunk_flags,
-                    request_stream.id,
-                    body[offset .. offset + chunk_len],
-                );
+                try writeHttp2Frame(transport, .data, chunk_flags, request_stream.id, body[offset .. offset + chunk_len]);
                 request_stream.send_window -= @intCast(chunk_len);
                 stream_manager.connection_send_window -= @intCast(chunk_len);
                 offset += chunk_len;
@@ -1381,26 +1394,30 @@ pub const Client = struct {
         var response_done = false;
         var got_end_stream = false;
 
-        var peer_settings = http.Http2Connection.Http2ConnectionSettings{};
-
         var frame_counter: usize = 0;
         while (!response_done) {
             frame_counter += 1;
             if (frame_counter > 10_000) return error.ProtocolError;
 
-            const frame = self.readHttp2Frame(transport) catch |err| switch (err) {
-                error.UnexpectedEof => {
-                    // RFC 7540 section 6.8: a server may close the connection
-                    // after sending the final frame. If we already received a
-                    // complete response (END_STREAM seen, status code present),
-                    // treat the clean close as end-of-response rather than error.
-                    if (got_end_stream and status_code != null) {
-                        response_done = true;
-                        continue;
-                    }
-                    return error.InvalidResponse;
-                },
-                else => return err,
+            const frame: BufferedFrame = if (pending_index < pending_frames.items.len) blk: {
+                defer pending_index += 1;
+                break :blk pending_frames.items[pending_index];
+            } else blk: {
+                const f = self.readHttp2Frame(transport) catch |err| switch (err) {
+                    error.UnexpectedEof => {
+                        // RFC 7540 section 6.8: a server may close the connection
+                        // after sending the final frame. If we already received a
+                        // complete response (END_STREAM seen, status code present),
+                        // treat the clean close as end-of-response rather than error.
+                        if (got_end_stream and status_code != null) {
+                            response_done = true;
+                            continue;
+                        }
+                        return error.InvalidResponse;
+                    },
+                    else => return err,
+                };
+                break :blk .{ .header = f.header, .payload = f.payload };
             };
             defer self.allocator.free(frame.payload);
 
@@ -1596,6 +1613,8 @@ pub const Client = struct {
                         response_done = true;
                     }
                 },
+                // Unknown / GREASE / extension frame types are ignored per RFC 7540 section 4.1.
+                _ => {},
             }
         }
 
@@ -1622,6 +1641,66 @@ pub const Client = struct {
         }
 
         return response;
+    }
+
+    const BufferedFrame = struct { header: http.Http2FrameHeader, payload: []u8 };
+
+    /// Read and process exactly one frame while we are blocked on send flow control. This is what lets a request body exceed the
+    /// peer's initial 65535-byte window: SETTINGS (with a changed initial window) and WINDOW_UPDATE frames grant more send window;
+    /// PING is answered. GOAWAY / RST_STREAM on our stream abort. A frame that belongs to the RESPONSE (a legal early response) is
+    /// buffered into `pending` so the response loop replays it in order. Loops in the caller until a window opens.
+    fn pumpUntilSendWindow(
+        self: *Self,
+        transport: anytype,
+        stream_manager: *h2stream.StreamManager,
+        request_stream: *h2stream.Stream,
+        peer_settings: *http.Http2Connection.Http2ConnectionSettings,
+        peer_max_frame_size: *u32,
+        pending: *std.ArrayList(BufferedFrame),
+    ) !void {
+        const frame = try self.readHttp2Frame(transport);
+        var keep_payload = false;
+        defer if (!keep_payload) self.allocator.free(frame.payload);
+        switch (frame.header.frame_type) {
+            .settings => {
+                if (frame.header.stream_id != 0) return error.ProtocolError;
+                if ((frame.header.flags & 0x01) == 0) {
+                    try http.applySettingsPayload(peer_settings, frame.payload);
+                    try stream_manager.applyPeerSettings(peer_settings.*);
+                    peer_max_frame_size.* = peer_settings.max_frame_size;
+                    try writeHttp2Frame(transport, .settings, 0x01, 0, &.{});
+                }
+            },
+            .window_update => {
+                if (frame.payload.len != 4) return error.ProtocolError;
+                const inc: u31 = (@as(u31, frame.payload[0] & 0x7F) << 24) | (@as(u31, frame.payload[1]) << 16) | (@as(u31, frame.payload[2]) << 8) | frame.payload[3];
+                if (inc != 0) {
+                    if (frame.header.stream_id == 0) {
+                        try stream_manager.updateConnectionSendWindow(@intCast(inc));
+                    } else if (frame.header.stream_id == request_stream.id) {
+                        try request_stream.updateSendWindow(@intCast(inc));
+                    }
+                }
+            },
+            .ping => {
+                if (frame.header.stream_id != 0) return error.ProtocolError;
+                if ((frame.header.flags & 0x01) == 0) {
+                    if (frame.payload.len != 8) return error.ProtocolError;
+                    try writeHttp2Frame(transport, .ping, 0x01, 0, frame.payload);
+                }
+            },
+            .goaway => return error.StreamError,
+            .rst_stream => if (frame.header.stream_id == request_stream.id) return error.StreamError,
+            .priority => {},
+            .headers, .data, .continuation, .push_promise => {
+                // Early response frame — buffer for the response loop to replay in order.
+                try pending.append(self.allocator, .{ .header = frame.header, .payload = frame.payload });
+                keep_payload = true;
+            },
+            // Unknown / GREASE / extension frame types: ignored per RFC 7540 section 4.1 (payload freed by the
+            // keep_payload=false defer). Never buffered, so they cannot pollute the response replay.
+            _ => {},
+        }
     }
 
     fn readHttp2Frame(self: *Self, transport: anytype) !struct { header: http.Http2FrameHeader, payload: []u8 } {
@@ -2562,4 +2641,202 @@ test "RequestOptions per-request overrides" {
     try std.testing.expectEqual(false, opts.verify_ssl.?);
     try std.testing.expectEqual(false, opts.keep_alive.?);
     try std.testing.expectEqualStrings("/tmp/test.sock", opts.unix_socket_path.?);
+}
+
+test "HTTP/2 send flow control waits for WINDOW_UPDATE beyond initial window" {
+    const allocator = std.testing.allocator;
+
+    // Build the scripted server -> client byte stream the mock transport replays on readNoEof.
+    var script = std.ArrayList(u8).empty;
+    defer script.deinit(allocator);
+
+    // (1) server SETTINGS (empty payload, non-ack) so the client acks and applies peer settings.
+    {
+        const h = http.Http2FrameHeader{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
+        try script.appendSlice(allocator, &h.serialize());
+    }
+    // (2) connection-level WINDOW_UPDATE (+1_000_000) grants connection send window.
+    {
+        const wu = h2stream.buildWindowUpdatePayload(1_000_000);
+        const h = http.Http2FrameHeader{ .length = 4, .frame_type = .window_update, .flags = 0, .stream_id = 0 };
+        try script.appendSlice(allocator, &h.serialize());
+        try script.appendSlice(allocator, &wu);
+    }
+    // (3) stream-1 WINDOW_UPDATE (+1_000_000) grants per-stream send window (first client stream id is 1).
+    {
+        const wu = h2stream.buildWindowUpdatePayload(1_000_000);
+        const h = http.Http2FrameHeader{ .length = 4, .frame_type = .window_update, .flags = 0, .stream_id = 1 };
+        try script.appendSlice(allocator, &h.serialize());
+        try script.appendSlice(allocator, &wu);
+    }
+    // (4) response HEADERS on stream 1 (END_HEADERS | END_STREAM) carrying :status = 200.
+    var hctx = hpack.HpackContext.init(allocator);
+    defer hctx.deinit();
+    const status_headers = [_]hpack.HeaderEntry{.{ .name = ":status", .value = "200" }};
+    const hdr_block = try hpack.encodeHeaders(&hctx, &status_headers, allocator);
+    defer allocator.free(hdr_block);
+    {
+        const h = http.Http2FrameHeader{ .length = @intCast(hdr_block.len), .frame_type = .headers, .flags = 0x04 | 0x01, .stream_id = 1 };
+        try script.appendSlice(allocator, &h.serialize());
+        try script.appendSlice(allocator, hdr_block);
+    }
+
+    const MockH2Transport = struct {
+        allocator: Allocator,
+        to_read: []const u8,
+        cursor: usize = 0,
+        sent: std.ArrayList(u8) = .empty,
+
+        fn writeAll(self: *@This(), data: []const u8) !void {
+            try self.sent.appendSlice(self.allocator, data);
+        }
+        fn readNoEof(self: *@This(), out: []u8) !void {
+            if (self.cursor + out.len > self.to_read.len) return error.UnexpectedEof;
+            @memcpy(out, self.to_read[self.cursor .. self.cursor + out.len]);
+            self.cursor += out.len;
+        }
+    };
+
+    var mock = MockH2Transport{ .allocator = allocator, .to_read = script.items };
+    defer mock.sent.deinit(allocator);
+
+    // 80_000-byte body exceeds the peer's initial 65535-byte send window, so the send loop must pause after ~65535 bytes and
+    // resume only after the scripted WINDOW_UPDATE frames arrive. With the old `return error.FlowControlError` this path errors.
+    const body = try allocator.alloc(u8, 80_000);
+    defer allocator.free(body);
+    @memset(body, 'x');
+
+    var client = Client.init(allocator);
+    defer client.deinit();
+
+    var req = try Request.init(allocator, .POST, "https://example.com/v1/chat");
+    defer req.deinit();
+    try req.setBody(body);
+
+    var response = try client.executeHttp2WithTransport(&req, &mock);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+
+    // Prove the full 80_000-byte body was actually sent: sum the payload length of every DATA frame on stream 1.
+    const sent = mock.sent.items;
+    try std.testing.expect(std.mem.startsWith(u8, sent, http.HTTP2_PREFACE));
+    var idx: usize = http.HTTP2_PREFACE.len;
+    var data_bytes: usize = 0;
+    while (idx + 9 <= sent.len) {
+        var hb: [9]u8 = undefined;
+        @memcpy(&hb, sent[idx .. idx + 9]);
+        const fh = http.Http2FrameHeader.parse(hb);
+        idx += 9;
+        const plen: usize = @intCast(fh.length);
+        if (idx + plen > sent.len) break;
+        if (fh.frame_type == .data and fh.stream_id == 1) data_bytes += plen;
+        idx += plen;
+    }
+    try std.testing.expectEqual(@as(usize, 80_000), data_bytes);
+}
+
+test "HTTP/2 send flow control buffers an early response arriving before the stream window opens" {
+    const allocator = std.testing.allocator;
+
+    // Scripted so a RESPONSE frame (HEADERS) arrives WHILE the stream send window is still 0 — forcing the send-side pump to
+    // BUFFER it into pending_frames and the response loop to replay it in order. This is the ownership-critical path the first
+    // test does not reach (there, all window-openers precede the response).
+    var script = std.ArrayList(u8).empty;
+    defer script.deinit(allocator);
+
+    // (1) server SETTINGS (empty, non-ack).
+    {
+        const h = http.Http2FrameHeader{ .length = 0, .frame_type = .settings, .flags = 0, .stream_id = 0 };
+        try script.appendSlice(allocator, &h.serialize());
+    }
+    // (2) connection WINDOW_UPDATE (+1_000_000): opens the CONNECTION window but NOT the stream window, so the send loop stays
+    //     blocked on the per-stream window and keeps pumping.
+    {
+        const wu = h2stream.buildWindowUpdatePayload(1_000_000);
+        const h = http.Http2FrameHeader{ .length = 4, .frame_type = .window_update, .flags = 0, .stream_id = 0 };
+        try script.appendSlice(allocator, &h.serialize());
+        try script.appendSlice(allocator, &wu);
+    }
+    // (3) response HEADERS on stream 1, END_HEADERS (0x04) but NOT END_STREAM, :status = 200. The stream window is still 0 here,
+    //     so the pump BUFFERS this frame into pending_frames.
+    var hctx = hpack.HpackContext.init(allocator);
+    defer hctx.deinit();
+    const status_headers = [_]hpack.HeaderEntry{.{ .name = ":status", .value = "200" }};
+    const hdr_block = try hpack.encodeHeaders(&hctx, &status_headers, allocator);
+    defer allocator.free(hdr_block);
+    {
+        const h = http.Http2FrameHeader{ .length = @intCast(hdr_block.len), .frame_type = .headers, .flags = 0x04, .stream_id = 1 };
+        try script.appendSlice(allocator, &h.serialize());
+        try script.appendSlice(allocator, hdr_block);
+    }
+    // (4) stream-1 WINDOW_UPDATE (+1_000_000): opens the stream window so the client finishes sending the 80_000-byte body.
+    {
+        const wu = h2stream.buildWindowUpdatePayload(1_000_000);
+        const h = http.Http2FrameHeader{ .length = 4, .frame_type = .window_update, .flags = 0, .stream_id = 1 };
+        try script.appendSlice(allocator, &h.serialize());
+        try script.appendSlice(allocator, &wu);
+    }
+    // (5) response DATA on stream 1 with END_STREAM (0x01), payload "hi".
+    {
+        const h = http.Http2FrameHeader{ .length = 2, .frame_type = .data, .flags = 0x01, .stream_id = 1 };
+        try script.appendSlice(allocator, &h.serialize());
+        try script.appendSlice(allocator, "hi");
+    }
+
+    const MockH2Transport = struct {
+        allocator: Allocator,
+        to_read: []const u8,
+        cursor: usize = 0,
+        sent: std.ArrayList(u8) = .empty,
+
+        fn writeAll(self: *@This(), data: []const u8) !void {
+            try self.sent.appendSlice(self.allocator, data);
+        }
+        fn readNoEof(self: *@This(), out: []u8) !void {
+            if (self.cursor + out.len > self.to_read.len) return error.UnexpectedEof;
+            @memcpy(out, self.to_read[self.cursor .. self.cursor + out.len]);
+            self.cursor += out.len;
+        }
+    };
+
+    var mock = MockH2Transport{ .allocator = allocator, .to_read = script.items };
+    defer mock.sent.deinit(allocator);
+
+    const body = try allocator.alloc(u8, 80_000);
+    defer allocator.free(body);
+    @memset(body, 'x');
+
+    var client = Client.init(allocator);
+    defer client.deinit();
+
+    var req = try Request.init(allocator, .POST, "https://example.com/v1/chat");
+    defer req.deinit();
+    try req.setBody(body);
+
+    // The buffered HEADERS must be replayed to the response loop and freed exactly once. std.testing.allocator turns any
+    // leak or double-free of that buffered payload into a test failure.
+    var response = try client.executeHttp2WithTransport(&req, &mock);
+    defer response.deinit();
+
+    try std.testing.expectEqual(@as(u16, 200), response.status.code);
+    try std.testing.expect(response.body != null);
+    try std.testing.expectEqualStrings("hi", response.body.?);
+
+    // The entire 80_000-byte body still went out despite the early response.
+    const sent = mock.sent.items;
+    try std.testing.expect(std.mem.startsWith(u8, sent, http.HTTP2_PREFACE));
+    var idx: usize = http.HTTP2_PREFACE.len;
+    var data_bytes: usize = 0;
+    while (idx + 9 <= sent.len) {
+        var hb: [9]u8 = undefined;
+        @memcpy(&hb, sent[idx .. idx + 9]);
+        const fh = http.Http2FrameHeader.parse(hb);
+        idx += 9;
+        const plen: usize = @intCast(fh.length);
+        if (idx + plen > sent.len) break;
+        if (fh.frame_type == .data and fh.stream_id == 1) data_bytes += plen;
+        idx += plen;
+    }
+    try std.testing.expectEqual(@as(usize, 80_000), data_bytes);
 }

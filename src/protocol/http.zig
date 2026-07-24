@@ -237,6 +237,10 @@ pub const Http2FrameType = enum(u8) {
     goaway = 0x7,
     window_update = 0x8,
     continuation = 0x9,
+    // Non-exhaustive: unknown / GREASE / extension frame types (>= 0x0A) parse without panicking. RFC 7540 section 4.1
+    // requires an endpoint to ignore frame types it does not understand, and CDN/gateway-fronted peers legitimately
+    // send them. Keeping this open makes @enumFromInt(any u8) total.
+    _,
 };
 
 /// Represents the 9-byte header standard for all HTTP/2 frames.

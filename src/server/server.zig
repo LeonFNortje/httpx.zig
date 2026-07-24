@@ -1134,6 +1134,8 @@ pub const Server = struct {
                     return;
                 },
                 .window_update, .priority, .push_promise => {},
+                // Unknown / GREASE / extension frame types are ignored per RFC 7540 section 4.1.
+                _ => {},
             }
         }
 
