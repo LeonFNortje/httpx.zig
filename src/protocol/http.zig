@@ -287,6 +287,9 @@ pub const Http2Settings = enum(u16) {
     initial_window_size = 0x4,
     max_frame_size = 0x5,
     max_header_list_size = 0x6,
+    // Non-exhaustive so an unknown SETTINGS id (e.g. a gateway's ENABLE_CONNECT_PROTOCOL) is a valid value
+    // rather than an @enumFromInt panic -- see applySettingsPayload. Mirrors the non-exhaustive Http2FrameType.
+    _,
 };
 
 /// Standard error codes for HTTP/2 stream and connection termination.
@@ -444,6 +447,8 @@ pub fn applySettingsPayload(settings: *Http2Connection.Http2ConnectionSettings, 
             .initial_window_size => settings.initial_window_size = value,
             .max_frame_size => settings.max_frame_size = value,
             .max_header_list_size => settings.max_header_list_size = value,
+            // RFC 7540 6.5.2: an endpoint MUST ignore a SETTINGS frame's unknown/unsupported identifiers.
+            else => {},
         }
     }
 }
