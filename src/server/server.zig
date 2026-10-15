@@ -109,8 +109,87 @@ pub const Context = struct {
     params: std.StringHashMap([]const u8),
     data: std.StringHashMap(*anyopaque),
     server: ?*Server = null,
+    /// The HTTP/1.x connection, when the request arrived on one; `beginStream` writes to it. Null on HTTP/2 and HTTP/3.
+    stream_socket: ?*Socket = null,
+    /// True once `beginStream` sent the status line: the server must not send a response of its own after that.
+    stream_started: bool = false,
 
     const Self = @This();
+
+    /// A response body written straight to the connection as it is produced (Server-Sent Events, long downloads).
+    /// The connection closes when the handler returns, so the body needs no length and no chunk framing.
+    pub const Stream = struct {
+        socket: *Socket,
+        allocator: Allocator,
+
+        /// Writes raw body bytes. A client that went away surfaces as an error.
+        pub fn write(self: *Stream, data: []const u8) !void {
+            try self.socket.sendAll(data);
+        }
+
+        /// Writes one Server-Sent Event; multi-line data becomes several `data:` lines.
+        pub fn event(self: *Stream, evt: SseEvent) !void {
+            var payload = std.ArrayList(u8).empty;
+            defer payload.deinit(self.allocator);
+            const writer = list_writer.init(self.allocator, &payload);
+            if (evt.id) |id| try writer.print("id: {s}\n", .{id});
+            if (evt.event) |name| try writer.print("event: {s}\n", .{name});
+            if (evt.retry_ms) |retry_ms| try writer.print("retry: {d}\n", .{retry_ms});
+            var lines = mem.splitScalar(u8, evt.data, '\n');
+            while (lines.next()) |line| try writer.print("data: {s}\n", .{line});
+            try writer.writeAll("\n");
+            try self.socket.sendAll(payload.items);
+        }
+
+        /// Writes an SSE comment line (`: text`), the usual keep-alive ping; clients ignore it.
+        pub fn comment(self: *Stream, text_: []const u8) !void {
+            var payload = std.ArrayList(u8).empty;
+            defer payload.deinit(self.allocator);
+            const writer = list_writer.init(self.allocator, &payload);
+            try writer.print(": {s}\n\n", .{text_});
+            try self.socket.sendAll(payload.items);
+        }
+
+        /// Ends the stream: the returned response tells the server to send nothing more and close the connection.
+        pub fn finish(self: *Stream) Response {
+            var resp = Response.init(self.allocator, 200);
+            resp.streamed = true;
+            return resp;
+        }
+    };
+
+    /// Options for `beginStream`.
+    pub const StreamOptions = struct {
+        content_type: []const u8 = "text/event-stream; charset=utf-8",
+        /// A send that blocks longer than this fails, so a client that stopped reading is dropped. 0 = no bound.
+        send_timeout_ms: u64 = 10_000,
+    };
+
+    /// Sends the status line and headers (the ones set on `response` so far, plus Content-Type, Cache-Control:
+    /// no-cache, Connection: close and X-Accel-Buffering: no) and returns a writer for the body. Return
+    /// `stream.finish()` from the handler. HTTP/1.x only: error.StreamingUnsupported on HTTP/2 and HTTP/3.
+    pub fn beginStream(self: *Self, opts: StreamOptions) !Stream {
+        const sock = self.stream_socket orelse return error.StreamingUnsupported;
+        if (self.stream_started) return error.StreamAlreadyStarted;
+
+        var head = std.ArrayList(u8).empty;
+        defer head.deinit(self.allocator);
+        const writer = list_writer.init(self.allocator, &head);
+        const st = status_mod.Status.fromCode(self.response.status_code);
+        try writer.print("HTTP/1.1 {d} {s}\r\n", .{ st.code, st.phrase });
+        for (self.response.headers.entries.items) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, HeaderName.CONTENT_LENGTH) or
+                std.ascii.eqlIgnoreCase(h.name, HeaderName.CONTENT_TYPE) or
+                std.ascii.eqlIgnoreCase(h.name, HeaderName.CONNECTION)) continue;
+            try writer.print("{s}: {s}\r\n", .{ h.name, h.value });
+        }
+        try writer.print("Content-Type: {s}\r\nCache-Control: no-cache\r\nConnection: close\r\nX-Accel-Buffering: no\r\n\r\n", .{opts.content_type});
+
+        if (opts.send_timeout_ms > 0) try sock.setSendTimeout(opts.send_timeout_ms);
+        self.stream_started = true;
+        try sock.sendAll(head.items);
+        return .{ .socket = sock, .allocator = self.allocator };
+    }
 
     /// Creates a new context for a request.
     pub fn init(allocator: Allocator, req: *Request) Self {
@@ -849,12 +928,14 @@ pub const Server = struct {
                 req.body = parser.getBody();
             }
 
-            var response = self.executeServerRequest(&req) catch |err| {
+            var response = self.executeServerRequestOn(&req, &sock) catch |err| {
                 self.log(.err, "Handler error: {}\n", .{err});
                 return self.sendError(&sock, status_mod.StatusCode.INTERNAL_SERVER_ERROR);
             };
 
             defer response.deinit();
+            // A streamed body ends with the connection.
+            if (response.streamed) return;
 
             const request_wants_keep_alive = req.headers.isKeepAlive(req.version);
             const keep_alive = self.config.keep_alive and request_wants_keep_alive;
@@ -1905,8 +1986,15 @@ pub const Server = struct {
     }
 
     fn executeServerRequest(self: *Self, req: *Request) !Response {
+        return self.executeServerRequestOn(req, null);
+    }
+
+    /// Runs the request through hooks, middleware and the router. `sock` is the HTTP/1.x connection, which lets a
+    /// handler stream its body (`Context.beginStream`).
+    fn executeServerRequestOn(self: *Self, req: *Request, sock: ?*Socket) !Response {
         var ctx = Context.init(self.allocator, req);
         ctx.server = self;
+        ctx.stream_socket = sock;
         defer ctx.deinit();
 
         for (self.pre_route_hooks.items) |hook| {
@@ -1970,7 +2058,18 @@ pub const Server = struct {
         try ctx.data.put("__fallback_state", @ptrCast(&fallback));
         defer _ = ctx.data.remove("__fallback_state");
 
-        var response = try self.executeMiddleware(&ctx, FallbackHandler.handle);
+        var response = self.executeMiddleware(&ctx, FallbackHandler.handle) catch |err| {
+            // Once the status line is out, an error can only end the stream: a second response would corrupt it.
+            if (ctx.stream_started) {
+                self.log(.err, "Stream handler error: {}\n", .{err});
+                var ended = Response.init(self.allocator, 200);
+                ended.streamed = true;
+                return ended;
+            }
+            return err;
+        };
+        if (ctx.stream_started) response.streamed = true;
+        if (response.streamed) return response;
 
         if (suppress_body or req.method == .HEAD) {
             if (response.body_owned) {
@@ -2635,4 +2734,67 @@ test "Server with thread pool handles connections" {
 
     try std.testing.expectEqual(@as(u16, 200), resp.status.code);
     try std.testing.expectEqualStrings("hello from worker pool", resp.text().?);
+}
+
+test "Context.beginStream writes SSE events straight to the connection" {
+    const allocator = std.testing.allocator;
+
+    var server = Server.initWithConfig(allocator, .{
+        .host = "127.0.0.1",
+        .port = 0,
+        .threads = 2,
+        .log_fn = &struct {
+            fn log_fn(_: LogLevel, _: []const u8) void {}
+        }.log_fn,
+    });
+    defer server.deinit();
+
+    const handler = struct {
+        fn h(ctx: *Context) anyerror!Response {
+            try ctx.setHeader("X-Request-Id", "r1");
+            var stream = try ctx.beginStream(.{});
+            try stream.event(.{ .id = "1", .event = "todo", .data = "a\nb" });
+            try stream.comment("ping");
+            return stream.finish();
+        }
+    }.h;
+    try server.get("/events", handler);
+
+    const thread = try server.listenInBackground();
+    defer {
+        server.stop();
+        thread.join();
+    }
+    sleepMs(50);
+
+    var sock = try Socket.createForAddress(try net.Address.parseIp("127.0.0.1", server.listeningPort()));
+    defer sock.close();
+    try sock.connect(try net.Address.parseIp("127.0.0.1", server.listeningPort()));
+    try sock.setRecvTimeout(5000);
+    try sock.sendAll("GET /events HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    var got = std.ArrayList(u8).empty;
+    defer got.deinit(allocator);
+    var buf: [1024]u8 = undefined;
+    while (true) {
+        const n = try sock.recv(&buf);
+        if (n == 0) break;
+        try got.appendSlice(allocator, buf[0..n]);
+    }
+
+    const out = got.items;
+    try std.testing.expect(mem.startsWith(u8, out, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(mem.indexOf(u8, out, "X-Request-Id: r1\r\n") != null);
+    try std.testing.expect(mem.indexOf(u8, out, "Content-Type: text/event-stream; charset=utf-8\r\n") != null);
+    try std.testing.expect(mem.indexOf(u8, out, "Content-Length") == null);
+    try std.testing.expect(mem.endsWith(u8, out, "\r\n\r\nid: 1\nevent: todo\ndata: a\ndata: b\n\n: ping\n\n"));
+}
+
+test "Context.beginStream is refused without an HTTP/1.x connection" {
+    const allocator = std.testing.allocator;
+    var req = try Request.init(allocator, .GET, "/events");
+    defer req.deinit();
+    var ctx = Context.init(allocator, &req);
+    defer ctx.deinit();
+    try std.testing.expectError(error.StreamingUnsupported, ctx.beginStream(.{}));
 }

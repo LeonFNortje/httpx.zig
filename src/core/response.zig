@@ -30,6 +30,9 @@ pub const Response = struct {
     body: ?[]const u8 = null,
     body_owned: bool = false,
     trailers: ?Headers = null,
+    /// Set by `Context.Stream.finish`: the handler already wrote the whole response to the connection, so the server
+    /// must send nothing more and close it.
+    streamed: bool = false,
 
     const Self = @This();
 
