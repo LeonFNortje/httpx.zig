@@ -52,13 +52,13 @@ pub fn main() !void {
 
     if (router.find(.GET, "/users/42")) |result| {
         std.debug.print("  GET /users/42 -> matched!\n", .{});
-        std.debug.print("    Parameters: {d}\n", .{result.params.len});
+        std.debug.print("    Parameters: {d}\n", .{result.params().len});
         std.debug.print("    Expected: id = 42\n", .{});
     }
 
     if (router.find(.GET, "/users/123/posts/456")) |result| {
         std.debug.print("  GET /users/123/posts/456 -> matched!\n", .{});
-        std.debug.print("    Parameters: {d}\n", .{result.params.len});
+        std.debug.print("    Parameters: {d}\n", .{result.params().len});
         std.debug.print("    Expected: userId = 123, postId = 456\n", .{});
     }
 

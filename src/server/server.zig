@@ -2012,7 +2012,7 @@ pub const Server = struct {
         }
 
         if (route_result) |r| {
-            for (r.params) |p| {
+            for (r.params()) |p| {
                 try ctx.params.put(p.name, p.value);
             }
         }

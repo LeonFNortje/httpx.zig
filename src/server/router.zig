@@ -148,18 +148,29 @@ pub const Router = struct {
         return segments.toOwnedSlice(self.allocator);
     }
 
+    /// A matched route. The captured parameters live inline, so the result stays valid when it is copied or returned.
+    pub const FindResult = struct {
+        handler: Handler,
+        params_buf: [16]RouteParam = undefined,
+        param_count: usize = 0,
+
+        /// The captured path parameters; borrows from `self`, so call it on the copy you keep.
+        pub fn params(self: *const FindResult) []const RouteParam {
+            return self.params_buf[0..self.param_count];
+        }
+    };
+
     /// Finds a matching route for the given method and path.
-    pub fn find(self: *Self, method: types.Method, path: []const u8) ?struct { handler: Handler, params: []const RouteParam } {
-        var params_buf: [16]RouteParam = undefined;
+    pub fn find(self: *Self, method: types.Method, path: []const u8) ?FindResult {
+        var result: FindResult = .{ .handler = undefined };
 
         for (self.routes.items) |route| {
             if (route.method != method) continue;
 
-            if (self.matchRoute(route, path, &params_buf)) |param_count| {
-                return .{
-                    .handler = route.handler,
-                    .params = params_buf[0..param_count],
-                };
+            if (self.matchRoute(route, path, &result.params_buf)) |param_count| {
+                result.handler = route.handler;
+                result.param_count = param_count;
+                return result;
             }
         }
 
@@ -328,13 +339,13 @@ test "Router basic matching" {
 
     const result1 = router.find(.GET, "/users");
     try std.testing.expect(result1 != null);
-    try std.testing.expectEqual(@as(usize, 0), result1.?.params.len);
+    try std.testing.expectEqual(@as(usize, 0), result1.?.params().len);
 
     const result2 = router.find(.GET, "/users/123");
     try std.testing.expect(result2 != null);
-    try std.testing.expectEqual(@as(usize, 1), result2.?.params.len);
-    try std.testing.expectEqualStrings("id", result2.?.params[0].name);
-    try std.testing.expectEqualStrings("123", result2.?.params[0].value);
+    try std.testing.expectEqual(@as(usize, 1), result2.?.params().len);
+    try std.testing.expectEqualStrings("id", result2.?.params()[0].name);
+    try std.testing.expectEqualStrings("123", result2.?.params()[0].value);
 
     const result3 = router.find(.DELETE, "/users");
     try std.testing.expect(result3 == null);
@@ -355,11 +366,11 @@ test "Router multiple parameters" {
 
     const result = router.find(.GET, "/users/42/posts/99");
     try std.testing.expect(result != null);
-    try std.testing.expectEqual(@as(usize, 2), result.?.params.len);
-    try std.testing.expectEqualStrings("userId", result.?.params[0].name);
-    try std.testing.expectEqualStrings("42", result.?.params[0].value);
-    try std.testing.expectEqualStrings("postId", result.?.params[1].name);
-    try std.testing.expectEqualStrings("99", result.?.params[1].value);
+    try std.testing.expectEqual(@as(usize, 2), result.?.params().len);
+    try std.testing.expectEqualStrings("userId", result.?.params()[0].name);
+    try std.testing.expectEqualStrings("42", result.?.params()[0].value);
+    try std.testing.expectEqualStrings("postId", result.?.params()[1].name);
+    try std.testing.expectEqualStrings("99", result.?.params()[1].value);
 }
 
 test "Router convenience methods and group helpers" {
@@ -413,4 +424,27 @@ test "Router convenience methods and group helpers" {
     try std.testing.expect(router.find(.OPTIONS, "/api/users/1") != null);
     try std.testing.expect(router.find(.TRACE, "/api/diag") != null);
     try std.testing.expect(router.find(.CONNECT, "/api/tunnel") != null);
+}
+
+test "Router params survive the call and a copy of the result" {
+    const allocator = std.testing.allocator;
+    var router = Router.init(allocator);
+    defer router.deinit();
+
+    const handler = struct {
+        fn h(_: *@import("server.zig").Context) anyerror!@import("../core/response.zig").Response {
+            unreachable;
+        }
+    }.h;
+
+    try router.add(.GET, "/v1/mcp/servers/:project/:name/approval", handler);
+
+    const found = router.find(.GET, "/v1/mcp/servers/aizig/github/approval").?;
+    const moved = found;
+    const params = moved.params();
+    try std.testing.expectEqual(@as(usize, 2), params.len);
+    try std.testing.expectEqualStrings("project", params[0].name);
+    try std.testing.expectEqualStrings("aizig", params[0].value);
+    try std.testing.expectEqualStrings("name", params[1].name);
+    try std.testing.expectEqualStrings("github", params[1].value);
 }

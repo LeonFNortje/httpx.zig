@@ -310,6 +310,15 @@ pub const Parser = struct {
     }
 
     fn determineBodyState(self: *Self) void {
+        // RFC 9110 6.4.1: 1xx, 204 and 304 responses never carry a body, whatever their headers say.
+        if (self.mode == .response) {
+            if (self.status_code) |code| {
+                if ((code >= 100 and code < 200) or code == 204 or code == 304) {
+                    self.state = .complete;
+                    return;
+                }
+            }
+        }
         if (self.chunked) {
             self.state = .chunk_size;
         } else if (self.content_length) |len| {
@@ -532,4 +541,19 @@ test "Parser reset" {
     parser.reset();
     try std.testing.expect(!parser.isComplete());
     try std.testing.expect(parser.method == null);
+}
+
+test "Parser response 204 and 304 complete after the headers" {
+    const allocator = std.testing.allocator;
+    const cases = [_][]const u8{
+        "HTTP/1.1 204 No Content\r\nServer: x\r\n\r\n",
+        "HTTP/1.1 304 Not Modified\r\nETag: \"a\"\r\n\r\n",
+    };
+    for (cases) |raw| {
+        var parser = Parser.initResponse(allocator);
+        defer parser.deinit();
+        _ = try parser.feed(raw);
+        try std.testing.expect(parser.isComplete());
+        try std.testing.expectEqual(@as(usize, 0), parser.getBody().len);
+    }
 }
