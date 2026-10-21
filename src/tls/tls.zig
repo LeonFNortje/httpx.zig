@@ -141,6 +141,11 @@ pub const TlsSession = struct {
     app_write_buf: ?[]u8 = null,
 
     ca_bundle: ?std.crypto.Certificate.Bundle = null,
+    /// Randomness source handed to tls.zig as `opt.rng`. It MUST live in the session, not on handshake()'s stack:
+    /// the TLS 1.2 AEAD and CBC ciphers keep that `std.Random` (a pointer to this field) and call it for every
+    /// record's explicit IV, long after handshake() has returned. A stack local here made every TLS 1.2 write call
+    /// through a dangling pointer (SIGSEGV in Cipher.encrypt). Pinned with the rest of the session.
+    rng_source: std.Random.IoSource = .{ .io = undefined },
     conn: ?tlsz.Connection = null,
     tls_reader: ?tlsz.Connection.Reader = null,
     tls_writer: ?tlsz.Connection.Writer = null,
@@ -218,18 +223,7 @@ pub const TlsSession = struct {
             self.ca_bundle = bundle;
         }
 
-        const sni_host = self.config.server_name orelse hostname;
-        var rng_impl: std.Random.IoSource = .{ .io = io };
-
-        const conn = try tlsz.client(&self.net_in.?.reader, &self.net_out.?.writer, .{
-            .host = sni_host,
-            .root_ca = self.ca_bundle orelse .empty,
-            // tls.zig couples chain and hostname verification under one flag.
-            .insecure_skip_verify = !verify,
-            .alpn_protocols = self.config.alpn_protocols,
-            .now = std.Io.Timestamp.now(io, .real),
-            .rng = rng_impl.interface(),
-        });
+        const conn = try tlsz.client(&self.net_in.?.reader, &self.net_out.?.writer, self.clientOptions(io, hostname));
 
         self.conn = conn;
         self.connected = true;
@@ -242,6 +236,22 @@ pub const TlsSession = struct {
         // Surface the negotiated ALPN protocol so the HTTP client routes
         // HTTP/2 vs HTTP/1.1. Null means the server selected nothing → HTTP/1.1.
         self.negotiated_protocol = self.conn.?.alpn_protocol;
+    }
+
+    /// The tls.zig client options for a handshake to `hostname`. Everything they point at must outlive the
+    /// Connection: in particular `rng` points at `self.rng_source`, which the TLS 1.2 ciphers keep and call for
+    /// every record's explicit IV (see the field). Sets `self.rng_source`.
+    fn clientOptions(self: *Self, io: std.Io, hostname: []const u8) tlsz.config.Client {
+        self.rng_source = .{ .io = io };
+        return .{
+            .host = self.config.server_name orelse hostname,
+            .root_ca = self.ca_bundle orelse .empty,
+            // tls.zig couples chain and hostname verification under one flag.
+            .insecure_skip_verify = self.config.verify_mode == .none,
+            .alpn_protocols = self.config.alpn_protocols,
+            .now = std.Io.Timestamp.now(io, .real),
+            .rng = self.rng_source.interface(),
+        };
     }
 
     /// Reads decrypted data from the session.
@@ -386,6 +396,24 @@ test "System CA path" {
     if (builtin.os.tag == .linux or builtin.os.tag == .macos) {
         try std.testing.expect(path != null);
     }
+}
+
+test "TlsSession hands tls.zig an rng that lives in the session, not on the handshake stack" {
+    // Regression: the rng used to be a stack local of handshake(). tls.zig's TLS 1.2 ciphers keep the
+    // std.Random and call it on every encrypted record, so each TLS 1.2 write jumped through a dead
+    // stack frame (SIGSEGV in Cipher.encrypt). The pointer must stay valid as long as the session.
+    var session = TlsSession.init(TlsConfig.insecure(std.testing.allocator));
+    defer session.deinit();
+    const opts = session.clientOptions(std.testing.io, "example.com");
+    try std.testing.expectEqual(@as(*anyopaque, @ptrCast(&session.rng_source)), opts.rng.ptr);
+    const lo = @intFromPtr(&session);
+    try std.testing.expect(@intFromPtr(opts.rng.ptr) >= lo and @intFromPtr(opts.rng.ptr) < lo + @sizeOf(TlsSession));
+    // And it still produces bytes after the builder has returned.
+    var buf: [16]u8 = @splat(0);
+    opts.rng.bytes(&buf);
+    try std.testing.expect(!std.mem.allEqual(u8, &buf, 0));
+    try std.testing.expectEqualStrings("example.com", opts.host);
+    try std.testing.expect(opts.insecure_skip_verify);
 }
 
 test "TLS version strings" {
